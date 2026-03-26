@@ -1,9 +1,16 @@
 require("dotenv").config();
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require("@whiskeysockets/baileys");
 const { google } = require("googleapis");
+const pino = require("pino");
 const Database = require("better-sqlite3");
 const cron = require("node-cron");
 const qrcode = require("qrcode");
+const qrcodeTerminal = require("qrcode-terminal");
 const fs = require("fs");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
@@ -57,9 +64,9 @@ function savePendingTx(token, tx) {
     fecha: tx.fecha,
     tipo: tx.tipo,
     cantidad: tx.cantidad,
-    factura_amt: tx.facturaAmt,
+    facturaAmt: tx.facturaAmt,
     comentarios: tx.comentarios,
-    chat_id: tx.chatId,
+    chatId: tx.chatId,
     created_at: new Date().toISOString(),
   });
 }
@@ -170,24 +177,49 @@ function formatTimeSince(isoString) {
 }
 
 // ─── BOT ───────────────────────────────────────────────────────────────────
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: "auth_info" }),
-  puppeteer: {
-    headless: true,
-    executablePath:
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  },
-});
+let sockGlobal = null;
 
-client.on("qr", async (qr) => {
-  await qrcode.toFile("qr.png", qr);
-  console.log("📱 QR generado. Abre qr.png y escanéalo con WhatsApp.");
-});
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+  const { version } = await fetchLatestBaileysVersion();
 
-client.on("ready", () => {
-  console.log("✅ Bot conectado a WhatsApp");
-  if (fs.existsSync("qr.png")) fs.unlinkSync("qr.png");
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false, // Lo manejamos manualmente
+  });
+
+  sockGlobal = sock;
+
+  sock.ev.on("creds.update", saveCreds);
+
+  // ── MANEJO MANUAL DEL QR (Archivo + Terminal) ──────────────────────────
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      // 1. Guardar en archivo (Modo "Escritura")
+      await qrcode.toFile("qr.png", qr);
+      
+      // 2. Imprimir en terminal (Para ver en VPS)
+      console.log("\n📱 ================================================");
+      console.log("📱 QR GENERADO. Escanea desde tu celular.");
+      console.log("📱 ================================================\n");
+      qrcodeTerminal.generate(qr, { small: true });
+    }
+
+    if (connection === "close") {
+      const shouldReconnect =
+        (lastDisconnect.error instanceof Boom)?.output?.statusCode !==
+        DisconnectReason.loggedOut;
+      console.log(
+        `⚠️  Conexión cerrada. Reconectando: ${shouldReconnect}`
+      );
+      if (shouldReconnect) startBot();
+    } else if (connection === "open") {
+      console.log("✅ Bot conectado a WhatsApp");
+      if (fs.existsSync("qr.png")) fs.unlinkSync("qr.png");
+    }
+  });
 
   // ── CRON: Recordatorio diario 6pm Monterrey ───────────────────────────
   cron.schedule(
@@ -196,7 +228,7 @@ client.on("ready", () => {
       const pending = getAllPendingTx();
 
       if (pending.length === 0) {
-        await client.sendMessage(
+        await sock.sendMessage(
           MY_NUMBER,
           "✅ *Reporte 6PM*\n\nNo hay transacciones pendientes. Todo al día 👌"
         );
@@ -222,186 +254,179 @@ client.on("ready", () => {
       msg += `─────────────────────\n`;
       msg += `Para aprobar: /aprobar XXXXXX\nPara rechazar: /rechazar XXXXXX`;
 
-      await client.sendMessage(MY_NUMBER, msg);
-      await client.sendMessage(APPROVER_NUMBER, msg);
+      await sock.sendMessage(MY_NUMBER, msg);
+      await sock.sendMessage(APPROVER_NUMBER, msg);
     },
     { timezone: "America/Monterrey" }
   );
-});
+}
 
-client.on("auth_failure", (msg) => {
-  console.error("❌ Error de autenticación:", msg);
-});
-
-client.on("disconnected", (reason) => {
-  console.log("❌ Bot desconectado:", reason);
-});
+startBot().catch(console.error);
 
 // ── MENSAJES ───────────────────────────────────────────────────────────────
-client.on("message", async (msg) => {
-  // Obtener número real aunque venga en formato @lid
-  const chat = await msg.getChat();
-  const contact = await msg.getContact();
-  const senderNumber = contact.number; // número limpio ej: 5218184670320
-  const sender = `${senderNumber}@c.us`;
-  const chatId = msg.from;
-  const trimmed = msg.body.trim();
+setTimeout(() => {
+  if (!sockGlobal) return;
 
-  // DEBUG TEMPORAL
-  console.log("📨 Mensaje recibido:");
-  console.log("   chatId     :", chatId);
-  console.log("   sender     :", sender);
-  console.log("   msg.fromMe :", msg.fromMe);
-  console.log("   msg.body   :", trimmed);
-  console.log("   MY_NUMBER  :", MY_NUMBER);
-  console.log("   APPROVER   :", APPROVER_NUMBER);
+  sockGlobal.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
 
-  if (msg.fromMe) return;
-  if (!trimmed) return;
+    for (const msg of messages) {
+      if (msg.key.fromMe) return;
 
-  // ── COMANDO DE TRANSACCIÓN ────────────────────────────────────────────
-  if (
-    trimmed.startsWith("/") &&
-    !trimmed.startsWith("/aprobar") &&
-    !trimmed.startsWith("/rechazar")
-  ) {
-    if (sender !== MY_NUMBER) return;
+      const sender = msg.key.remoteJid;
+      const chatId = msg.key.remoteJid;
+      const text =
+        msg.message?.conversation ||
+        msg.message?.extendedTextMessage?.text ||
+        "";
+      const trimmed = text.trim();
 
-    const parsed = parseCommand(trimmed);
-    if (!parsed) {
-      await client.sendMessage(
-        chatId,
-        "❌ *Formato incorrecto*\n\n" +
-          "Usa:\n`/DD/MM tipo cantidad comentarios`\n\n" +
-          "*Ejemplos:*\n" +
-          "`/26/3 ingreso 50,000 efectivo venado`\n" +
-          "`/26/3 egreso 15,000 renta oficina`\n" +
-          "`/26/3 factura 50,000 gumesa 1`"
-      );
-      return;
-    }
+      // DEBUG
+      console.log("📨 Mensaje:", trimmed, "de:", sender);
 
-    let facturaAmt = 0;
-    if (parsed.tipo === "factura") {
-      facturaAmt = parseFloat((parsed.cantidad * 0.025).toFixed(2));
-    }
+      if (!text) return;
 
-    const token = getNextToken();
-    savePendingTx(token, {
-      fecha: parsed.fecha,
-      tipo: parsed.tipo,
-      cantidad: parsed.cantidad,
-      facturaAmt,
-      comentarios: parsed.comentarios,
-      chatId,
-    });
+      // ── COMANDO DE TRANSACCIÓN ────────────────────────────────────────────
+      if (
+        trimmed.startsWith("/") &&
+        !trimmed.startsWith("/aprobar") &&
+        !trimmed.startsWith("/rechazar")
+      ) {
+        if (sender !== MY_NUMBER) return;
 
-    let detalle =
-      `${tipoEmoji(parsed.tipo)} *Solicitud de ${parsed.tipo.toUpperCase()}*\n\n` +
-      `📅 Fecha: ${parsed.fecha}\n` +
-      `💰 Cantidad: $${formatMoney(parsed.cantidad)}\n`;
+        const parsed = parseCommand(trimmed);
+        if (!parsed) {
+          await sockGlobal.sendMessage(
+            chatId,
+            "❌ *Formato incorrecto*\n\n" +
+              "Usa:\n`/DD/MM tipo cantidad comentarios`\n\n" +
+              "*Ejemplos:*\n" +
+              "`/26/3 ingreso 50,000 efectivo venado`\n" +
+              "`/26/3 egreso 15,000 renta oficina`\n" +
+              "`/26/3 factura 50,000 gumesa 1`"
+          );
+          return;
+        }
 
-    if (parsed.tipo === "factura") {
-      detalle += `🏷️ Comisión (2.5%): $${formatMoney(facturaAmt)}\n`;
-    }
+        let facturaAmt = 0;
+        if (parsed.tipo === "factura") {
+          facturaAmt = parseFloat((parsed.cantidad * 0.025).toFixed(2));
+        }
 
-    detalle +=
-      `📝 Comentarios: ${parsed.comentarios}\n\n` +
-      `🔑 ID: *${token}*\n\n` +
-      `⏳ Esperando aprobación...\n` +
-      `✅ Aprobar: /aprobar ${token}\n` +
-      `❌ Rechazar: /rechazar ${token}`;
+        const token = getNextToken();
+        savePendingTx(token, {
+          fecha: parsed.fecha,
+          tipo: parsed.tipo,
+          cantidad: parsed.cantidad,
+          facturaAmt,
+          comentarios: parsed.comentarios,
+          chatId,
+        });
 
-    await client.sendMessage(chatId, detalle);
-    return;
-  }
+        let detalle =
+          `${tipoEmoji(parsed.tipo)} *Solicitud de ${parsed.tipo.toUpperCase()}*\n\n` +
+          `📅 Fecha: ${parsed.fecha}\n` +
+          `💰 Cantidad: $${formatMoney(parsed.cantidad)}\n`;
 
-  // ── APROBAR ──────────────────────────────────────────────────────────
-  if (trimmed.startsWith("/aprobar")) {
-    if (sender !== APPROVER_NUMBER) return;
+        if (parsed.tipo === "factura") {
+          detalle += `🏷️ Comisión (2.5%): $${formatMoney(facturaAmt)}\n`;
+        }
 
-    const token = trimmed.split(" ")[1]?.trim();
+        detalle +=
+          `📝 Comentarios: ${parsed.comentarios}\n\n` +
+          `🔑 ID: *${token}*\n\n` +
+          `⏳ Esperando aprobación...\n` +
+          `✅ Aprobar: /aprobar ${token}\n` +
+          `❌ Rechazar: /rechazar ${token}`;
 
-    if (!token || !getPendingTx(token)) {
-      await client.sendMessage(
-        chatId,
-        `❌ ID \`${token}\` no encontrado o ya procesado.`
-      );
-      return;
-    }
-
-    const tx = getPendingTx(token);
-    deletePendingTx(token);
-
-    try {
-      await appendRow(
-        tx.fecha,
-        tx.tipo,
-        tx.cantidad,
-        tx.tipo === "factura" ? tx.facturaAmt : "",
-        tx.comentarios
-      );
-
-      const balance = await getBalance();
-
-      let confirmMsg =
-        `✅ *APROBADO* 🎉\n\n` +
-        `${tipoEmoji(tx.tipo)} *${tx.tipo.toUpperCase()}*\n` +
-        `🔑 ID: *${token}*\n\n` +
-        `📅 Fecha: ${tx.fecha}\n` +
-        `💰 Cantidad: $${formatMoney(tx.cantidad)}\n`;
-
-      if (tx.tipo === "factura") {
-        confirmMsg += `🏷️ Comisión (2.5%): $${formatMoney(tx.facturaAmt)}\n`;
+        await sockGlobal.sendMessage(chatId, detalle);
+        return;
       }
 
-      confirmMsg +=
-        `📝 Comentarios: ${tx.comentarios}\n\n` +
-        `📊 *Balance General: $${formatMoney(balance)}*`;
+      // ── APROBAR ──────────────────────────────────────────────────────────
+      if (trimmed.startsWith("/aprobar")) {
+        if (sender !== APPROVER_NUMBER) return;
 
-      await client.sendMessage(tx.chatId, confirmMsg);
-    } catch (err) {
-      console.error("❌ Error al escribir en Sheets:");
-      console.error("   Mensaje:", err.message);
-      console.error("   Detalle:", err.errors || err.response?.data || err);
-      savePendingTx(token, tx);
-      await client.sendMessage(
-        chatId,
-        "❌ Error al guardar en Google Sheets. La transacción sigue pendiente."
-      );
+        const token = trimmed.split(" ")[1]?.trim();
+
+        if (!token || !getPendingTx(token)) {
+          await sockGlobal.sendMessage(
+            chatId,
+            `❌ ID \`${token}\` no encontrado o ya procesado.`
+          );
+          return;
+        }
+
+        const tx = getPendingTx(token);
+        deletePendingTx(token);
+
+        try {
+          await appendRow(
+            tx.fecha,
+            tx.tipo,
+            tx.cantidad,
+            tx.tipo === "factura" ? tx.facturaAmt : "",
+            tx.comentarios
+          );
+
+          const balance = await getBalance();
+
+          let confirmMsg =
+            `✅ *APROBADO* 🎉\n\n` +
+            `${tipoEmoji(tx.tipo)} *${tx.tipo.toUpperCase()}*\n` +
+            `🔑 ID: *${token}*\n\n` +
+            `📅 Fecha: ${tx.fecha}\n` +
+            `💰 Cantidad: $${formatMoney(tx.cantidad)}\n`;
+
+          if (tx.tipo === "factura") {
+            confirmMsg += `🏷️ Comisión (2.5%): $${formatMoney(tx.facturaAmt)}\n`;
+          }
+
+          confirmMsg +=
+            `📝 Comentarios: ${tx.comentarios}\n\n` +
+            `📊 *Balance General: $${formatMoney(balance)}*`;
+
+          await sockGlobal.sendMessage(tx.chatId, confirmMsg);
+        } catch (err) {
+          console.error("❌ Error al escribir en Sheets:", err.message);
+          savePendingTx(token, tx);
+          await sockGlobal.sendMessage(
+            chatId,
+            "❌ Error al guardar en Google Sheets. La transacción sigue pendiente."
+          );
+        }
+        return;
+      }
+
+      // ── RECHAZAR ─────────────────────────────────────────────────────────
+      if (trimmed.startsWith("/rechazar")) {
+        if (sender !== APPROVER_NUMBER) return;
+
+        const token = trimmed.split(" ")[1]?.trim();
+
+        if (!token || !getPendingTx(token)) {
+          await sockGlobal.sendMessage(
+            chatId,
+            `❌ ID \`${token}\` no encontrado o ya procesado.`
+          );
+          return;
+        }
+
+        const tx = getPendingTx(token);
+        deletePendingTx(token);
+
+        await sockGlobal.sendMessage(
+          tx.chatId,
+          `❌ *RECHAZADO* 🚫\n\n` +
+            `${tipoEmoji(tx.tipo)} *${tx.tipo.toUpperCase()}*\n` +
+            `🔑 ID: *${token}*\n\n` +
+            `📅 Fecha: ${tx.fecha}\n` +
+            `💰 Cantidad: $${formatMoney(tx.cantidad)}\n` +
+            `📝 Comentarios: ${tx.comentarios}\n\n` +
+            `⚠️ Esta transacción *no* fue registrada.`
+        );
+        return;
+      }
     }
-    return;
-  }
-
-  // ── RECHAZAR ─────────────────────────────────────────────────────────
-  if (trimmed.startsWith("/rechazar")) {
-    if (sender !== APPROVER_NUMBER) return;
-
-    const token = trimmed.split(" ")[1]?.trim();
-
-    if (!token || !getPendingTx(token)) {
-      await client.sendMessage(
-        chatId,
-        `❌ ID \`${token}\` no encontrado o ya procesado.`
-      );
-      return;
-    }
-
-    const tx = getPendingTx(token);
-    deletePendingTx(token);
-
-    await client.sendMessage(
-      tx.chatId,
-      `❌ *RECHAZADO* 🚫\n\n` +
-        `${tipoEmoji(tx.tipo)} *${tx.tipo.toUpperCase()}*\n` +
-        `🔑 ID: *${token}*\n\n` +
-        `📅 Fecha: ${tx.fecha}\n` +
-        `💰 Cantidad: $${formatMoney(tx.cantidad)}\n` +
-        `📝 Comentarios: ${tx.comentarios}\n\n` +
-        `⚠️ Esta transacción *no* fue registrada.`
-    );
-    return;
-  }
-});
-
-client.initialize();
+  });
+}, 2000);
